@@ -31,3 +31,5 @@ On macOS, allow incoming connections for `node` if the firewall asks.
 - `server.js` — HTTP + WebSocket server, rooms, turns, bots (authoritative simulation)
 - `public/shared.js` — expression parser and shot simulator (used by server and browser)
 - `public/client.js`, `index.html`, `style.css` — the browser client
+- `calculate.py` — shot calculator: finds a function from your soldier to a target around the
+  obstacles and checks it with the game's own simulator. See [CALCULATE.md](CALCULATE.md).

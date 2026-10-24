@@ -183,6 +183,36 @@
   function soldierById(id) { return S.game && S.game.soldiers.find((s) => s.id === id); }
   function playerById(id) { return S.room && S.room.players.find((p) => p.id === id); }
 
+  // Console helper: type circles() in the browser console to list every obstacle in
+  // YOUR view (same coordinates as the hover readout), ready for calculate.py.
+  // r is rounded up so the circle is never under-sized.
+  window.circles = function () {
+    if (!S.game) { console.log('No game running.'); return; }
+    const list = S.game.obstacles
+      .map((o) => ({ x: +(viewSign() * o.x).toFixed(2), y: +o.y.toFixed(2), r: Math.ceil(o.r * 100) / 100 }))
+      .sort((a, b) => a.x - b.x);
+    console.table(list);
+    console.log(list.map((c) => `--circle ${c.x},${c.y},${c.r}`).join(' '));
+  };
+
+  // Console helper: type targets() to list every living enemy soldier in YOUR view,
+  // ready for calculate.py (--target x,y ...).
+  window.targets = function () {
+    if (!S.game) { console.log('No game running.'); return; }
+    const team = myTeam();
+    if (!team) { console.log('You are spectating - join a team to have enemies.'); return; }
+    const list = S.game.soldiers
+      .filter((s) => s.alive && s.team !== team)
+      .map((s) => {
+        const p = playerById(s.playerId);
+        return { player: p ? p.name : '?', x: +(viewSign() * s.x).toFixed(2), y: +s.y.toFixed(2) };
+      })
+      .sort((a, b) => a.x - b.x);
+    if (!list.length) { console.log('No enemies left.'); return; }
+    console.table(list);
+    console.log(list.map((t) => `--target ${t.x},${t.y}`).join(' '));
+  };
+
   function startGame(m) {
     S.gameOver = false;
     S.game = {
@@ -342,6 +372,16 @@
     obsCtx.globalCompositeOperation = 'destination-out';
     for (const e of g.explosions) { obsCtx.beginPath(); obsCtx.arc(toCx(e.x), toCy(e.y), e.r * u, 0, Math.PI * 2); obsCtx.fill(); }
     obsCtx.globalCompositeOperation = 'source-over';
+    // centre dot + radius label (helps reading circles for calculate.py)
+    obsCtx.font = `${Math.max(9, u * 0.55)}px ui-monospace, Menlo, monospace`;
+    obsCtx.textAlign = 'center'; obsCtx.textBaseline = 'top';
+    for (const o of g.obstacles) {
+      const cx = toCx(o.x), cy = toCy(o.y);
+      obsCtx.fillStyle = 'rgba(220,228,240,.85)';
+      obsCtx.beginPath(); obsCtx.arc(cx, cy, Math.max(1.5, u * 0.09), 0, Math.PI * 2); obsCtx.fill();
+      obsCtx.fillStyle = 'rgba(220,228,240,.6)';
+      obsCtx.fillText('r=' + o.r.toFixed(2), cx, cy + Math.max(3, u * 0.2));
+    }
   }
 
 
