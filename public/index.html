@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d0f14">
+<title>Graphwar</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d0f14'/%3E%3Cpath d='M4 24 C12 24 14 8 28 8' stroke='%234fc3f7' stroke-width='3' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="conn-banner" class="hidden">Connecting…</div>
+
+<!-- Home -->
+<section id="screen-home" class="screen">
+  <div class="home-wrap">
+    <h1 class="title"><span class="title-mark">∿</span>Graphwar</h1>
+    <p class="subtitle">A game of mathematical functions — on your local network.</p>
+    <div class="card">
+      <label class="field">
+        <span>Your name</span>
+        <input id="name-input" maxlength="20" autocomplete="nickname" placeholder="Player">
+      </label>
+      <button id="create-btn" class="btn primary">Create game</button>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Games on this network</h2><button id="refresh-btn" class="btn small ghost">Refresh</button></div>
+      <ul id="room-list" class="room-list"></ul>
+    </div>
+    <details class="card help">
+      <summary>How to play</summary>
+      <p>Two teams of soldiers sit on a plane from x = −25 to 25, y = −15 to 15. On your turn, type a function and fire: the shot follows its graph starting from your soldier, killing every soldier it touches until it hits an obstacle or leaves the plane.</p>
+      <p>Everyone sees the board from their own side, so you always fire to the right. The curve is shifted to pass through your soldier, so <code>y = 0</code> fires straight ahead and <code>y = x</code> rises at 45°.</p>
+      <p>Modes: <b>y =</b> f(x) · <b>y′ =</b> f(x, y) · <b>y″ =</b> f(x, y, y′) (starting with y′ = 0).</p>
+      <p>Functions: <code>sin cos tan asin acos atan sinh cosh tanh sqrt abs exp ln log sign floor</code>, constants <code>pi e</code>, operators <code>+ − * / ^</code>, implicit multiplication like <code>2x</code>.</p>
+      <p>Tip: steps like <code>5/(1+exp(-10(x+3)))</code> jump over obstacles.</p>
+    </details>
+  </div>
+</section>
+
+<!-- Room / setup -->
+<section id="screen-room" class="screen hidden">
+  <div class="room-wrap">
+    <header class="room-head">
+      <button id="leave-room-btn" class="btn small ghost">← Leave</button>
+      <input id="room-name" class="room-name" maxlength="30" disabled>
+      <span id="room-host-badge" class="badge"></span>
+    </header>
+    <div class="room-grid">
+      <div class="card options">
+        <h2>Game options</h2>
+        <div class="opt">
+          <span>Function</span>
+          <div class="seg" id="opt-mode">
+            <button data-v="y">y =</button><button data-v="dy">y′ =</button><button data-v="d2y">y″ =</button>
+          </div>
+        </div>
+        <div class="opt">
+          <span>Turn time</span>
+          <div class="seg" id="opt-time">
+            <button data-v="30">30s</button><button data-v="60">1m</button><button data-v="120">2m</button><button data-v="300">5m</button><button data-v="0">∞</button>
+          </div>
+        </div>
+        <div class="opt">
+          <span>Soldiers each</span>
+          <div class="seg" id="opt-soldiers">
+            <button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button>
+          </div>
+        </div>
+        <p id="opt-note" class="note"></p>
+        <button id="start-btn" class="btn primary big">Start game</button>
+      </div>
+      <div class="teams">
+        <div class="card team" data-team="1">
+          <div class="card-head"><h2 class="t1">Team 1</h2><button class="btn small join-team" data-team="1">Join</button></div>
+          <ul class="plist"></ul>
+          <div class="bot-row host-only"><button class="btn small ghost add-bot" data-team="1">+ Bot</button></div>
+        </div>
+        <div class="card team" data-team="2">
+          <div class="card-head"><h2 class="t2">Team 2</h2><button class="btn small join-team" data-team="2">Join</button></div>
+          <ul class="plist"></ul>
+          <div class="bot-row host-only"><button class="btn small ghost add-bot" data-team="2">+ Bot</button></div>
+        </div>
+        <div class="card team spect" data-team="0">
+          <div class="card-head"><h2>Spectators</h2><button class="btn small join-team" data-team="0">Watch</button></div>
+          <ul class="plist"></ul>
+        </div>
+        <div class="bot-level host-only">
+          Bot skill
+          <div class="seg" id="bot-level"><button data-v="1">Easy</button><button data-v="2" class="on">Normal</button><button data-v="3">Hard</button></div>
+        </div>
+      </div>
+      <div class="card chat-card">
+        <h2>Chat</h2>
+        <div class="chat-log" id="room-chat"></div>
+        <form class="chat-form" data-chat><input maxlength="200" placeholder="Say something…"><button class="btn small">Send</button></form>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Game -->
+<section id="screen-game" class="screen hidden">
+  <div class="game-wrap">
+    <header class="game-bar">
+      <button id="game-leave-btn" class="btn small ghost" title="Leave game">✕</button>
+      <div id="turn-label" class="turn-label"></div>
+      <div id="timer" class="timer"></div>
+      <button id="toggle-names" class="btn small ghost" title="Show names">Aa</button>
+      <button id="mute-btn" class="btn small ghost" title="Sound">♪</button>
+      <button id="chat-toggle" class="btn small ghost" title="Chat">💬<span id="chat-dot" class="dot hidden"></span></button>
+    </header>
+    <div class="game-main">
+      <div class="board-col">
+        <div id="board-box" class="board-box">
+          <canvas id="board"></canvas>
+          <div id="coords" class="coords"></div>
+          <div id="board-msg" class="board-msg hidden"></div>
+        </div>
+        <div class="rotate-hint">Tip: turn your phone sideways for a bigger board</div>
+        <form id="fire-form" class="fire-form" autocomplete="off">
+          <label id="fn-prefix" class="fn-prefix">y =</label>
+          <input id="fn-input" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="type a function, e.g. 0.5x" maxlength="300">
+          <button id="fire-btn" class="btn primary fire">Fire!</button>
+        </form>
+        <div id="fn-error" class="fn-error"></div>
+        <div id="keypad" class="keypad"></div>
+      </div>
+      <aside id="game-chat" class="card chat-card game-chat">
+        <div class="chat-log" id="game-chat-log"></div>
+        <form class="chat-form" data-chat><input maxlength="200" placeholder="Chat…"><button class="btn small">Send</button></form>
+      </aside>
+    </div>
+  </div>
+  <div id="gameover" class="overlay hidden">
+    <div class="card overlay-card">
+      <h2 id="gameover-title"></h2>
+      <button id="gameover-btn" class="btn primary">Back to room</button>
+    </div>
+  </div>
+</section>
+
+<div id="toast" class="toast hidden"></div>
+<script src="shared.js"></script>
+<script src="client.js"></script>
+</body>
+</html>
