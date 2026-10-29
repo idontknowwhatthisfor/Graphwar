@@ -55,10 +55,15 @@
     return out;
   }
 
+  // longest function the game accepts; 0 = unlimited (server: node server.js --unlimited)
+  let maxLen = 300;
+  const setMaxLen = (n) => { maxLen = n > 0 ? n : 0; };
+  const getMaxLen = () => maxLen;
+
   // AST nodes: ['n', v] | ['v', name] | ['neg', a] | [op, a, b] | ['f', name, a]
   function parse(src, allowedVars) {
     if (typeof src !== 'string' || !src.trim()) throw new Error('Empty function');
-    if (src.length > 300) throw new Error('Function too long');
+    if (maxLen && src.length > maxLen) throw new Error('Function too long (max ' + maxLen + ' characters)');
     const toks = tokenize(src);
     let p = 0, depth = 0;
     const peek = () => toks[p];
@@ -265,7 +270,7 @@
     return { points, hits, explosion, error: null };
   }
 
-  const GW = { PLANE, MODES, parse, compileFunction, newMask, paintCircle, maskAt, circleFree, simulateShot };
+  const GW = { PLANE, MODES, parse, compileFunction, setMaxLen, getMaxLen, newMask, paintCircle, maskAt, circleFree, simulateShot };
   if (typeof module !== 'undefined' && module.exports) module.exports = GW;
   else root.GW = GW;
 })(typeof window !== 'undefined' ? window : globalThis);

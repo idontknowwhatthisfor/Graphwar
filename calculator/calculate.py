@@ -39,6 +39,7 @@ except ImportError:
     sys.exit("calculate.py needs numpy:  pip3 install numpy")
 
 INF, NAN = float("inf"), float("nan")
+sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))   # unlimited-length functions nest deeply
 
 # ---- Plane (same numbers as shared.js) ------------------------------------------------
 XMIN, XMAX, YMIN, YMAX = -25.0, 25.0, -15.0, 15.0
@@ -46,7 +47,8 @@ PX_W, PX_H = 770, 450
 SCALE = PX_W / (XMAX - XMIN)
 SOLDIER_R = 0.5
 YLIM = 14.8          # the planner keeps the path a little inside the top/bottom edge
-MAX_LEN = 300        # the game rejects longer functions
+MAX_LEN = 300        # the game rejects longer functions (unless its server runs --unlimited)
+UNLIMITED = math.inf # pass as max_len to allow any length
 
 
 # =========================================================================================
@@ -128,6 +130,8 @@ def _div(a, b):
 
 
 def _pow(a, b):
+    if b == 2.0:
+        return a * a                    # the d2y bumps square every term
     if abs(a) == 1 and math.isinf(b):
         return NAN                      # JS: Math.pow(1, Infinity) is NaN
     try:
@@ -175,11 +179,11 @@ def tokenize(src):
     return out
 
 
-def parse(src, allowed):
+def parse(src, allowed, max_len=MAX_LEN):
     if not isinstance(src, str) or not src.strip():
         raise ValueError("Empty function")
-    if len(src) > MAX_LEN:
-        raise ValueError("Function too long")
+    if len(src) > max_len:
+        raise ValueError("Function too long (max %d characters)" % max_len)
     toks = tokenize(src)
     st = {"p": 0, "depth": 0}
 
@@ -291,8 +295,44 @@ def compile_ast(a):
     return lambda x, y, yp: _pow(f(x, y, yp), g(x, y, yp))
 
 
-def compile_function(src, mode):
-    return compile_ast(parse(src, MODES[mode][1]))
+_EVAL_NS = dict({"f_" + k: v for k, v in FUNCS.items()}, _div=_div, _pow=_pow)
+
+
+def ast_source(a):
+    """The AST as one Python expression with the same JS number semantics as compile_ast
+    (Python's float + - * already give inf/nan instead of raising)."""
+    return _src(a)[0]
+
+
+def _src(a):
+    """-> (source, precedence): 1 for + -, 2 for *, 3 for atoms. Only the parentheses the
+    evaluation order needs are written, so long a + b + c ... chains stay flat (Python's
+    parser refuses ~200 nested parentheses)."""
+    k = a[0]
+    if k == "n":
+        return repr(float(a[1])), 3
+    if k == "v":
+        return {"x": "x", "y": "y"}.get(a[1], "yp"), 3
+    if k == "neg":
+        s, p = _src(a[1])
+        return ("(-%s)" if p == 3 else "(-(%s))") % s, 3
+    if k == "f":
+        return "f_%s(%s)" % (a[1], _src(a[2])[0]), 3
+    (l, lp), (r, rp) = _src(a[1]), _src(a[2])
+    if k in ("+", "-", "*"):
+        p = 2 if k == "*" else 1
+        l = l if lp >= p else "(%s)" % l          # left-assoc: same level needs no parens
+        r = r if rp > p else "(%s)" % r           # a - (b + c), a*(b*c) keep theirs
+        return "%s %s %s" % (l, k, r), p
+    return "%s(%s, %s)" % ("_div" if k == "/" else "_pow", l, r), 3
+
+
+def compile_function(src, mode, max_len=MAX_LEN):
+    ast = parse(src, MODES[mode][1], max_len)
+    try:   # one flat function is ~5x faster than the closure tree in the simulator loop
+        return eval("lambda x, y, yp: " + ast_source(ast), dict(_EVAL_NS))
+    except (SyntaxError, RecursionError, MemoryError):
+        return compile_ast(ast)
 
 
 # =========================================================================================
@@ -408,45 +448,74 @@ def simulate(fn, mode, X0, Y0, soldiers, mask):
 # =========================================================================================
 # 3. Path planner: shortest x-monotone polyline that keeps `margin` away from every circle
 # =========================================================================================
+RES = 0.025                                   # clearance raster cell size
+_GX = np.arange(XMIN, XMAX + RES / 2, RES)
+_GY = np.arange(YMIN, YMAX + RES / 2, RES)
+_dist_cache = {}
+
+
+def _circle_dist(circles):
+    """Distance from every raster cell to the nearest circle edge (cached per obstacle set)."""
+    key = tuple(tuple(c) for c in circles)
+    if key not in _dist_cache:
+        D = np.full((len(_GY), len(_GX)), INF, np.float32)
+        for (x, y, r) in circles:
+            np.minimum(D, np.hypot(_GX[None, :] - x, _GY[:, None] - y) - r, out=D)
+        if len(_dist_cache) > 8:
+            _dist_cache.clear()
+        _dist_cache[key] = D
+    return _dist_cache[key]
+
+
 def make_clear(circles, margin, relax_pts):
     """Vectorised test: is (X, Y) at least `margin` from every circle and inside the board?
     Near the shooter/target the margin shrinks, so a soldier standing next to a rock
-    can still be reached."""
-    C = np.array(circles, dtype=float).reshape(-1, 3)
-    R = np.array(relax_pts, dtype=float).reshape(-1, 2)
+    can still be reached. The answer is precomputed on a RES raster, so a test is a lookup."""
+    D = _circle_dist(circles)
+    req = np.full(D.shape, margin, np.float32)
+    w = int(2 * margin / RES) + 2                 # beyond 2*margin the relaxation does nothing
+    for (px, py) in relax_pts:
+        i0, j0 = int(round((px - XMIN) / RES)), int(round((py - YMIN) / RES))
+        si, sj = slice(max(0, i0 - w), max(0, i0 + w + 1)), slice(max(0, j0 - w), max(0, j0 + w + 1))
+        d = np.hypot(_GX[None, si] - px, _GY[sj, None] - py)
+        np.minimum(req[sj, si], np.maximum(0.06, 0.5 * d), out=req[sj, si])
+    ok = (D >= req) & (np.abs(_GY) <= YLIM + 0.1)[:, None]
+    nx, ny = len(_GX) - 1, len(_GY) - 1
 
     def clear(X, Y):
-        X, Y = np.broadcast_arrays(np.asarray(X, float), np.asarray(Y, float))
-        d_end = np.min(np.hypot(X[..., None] - R[:, 0], Y[..., None] - R[:, 1]), axis=-1)
-        req = np.minimum(margin, np.maximum(0.06, 0.5 * d_end))
-        if len(C):
-            dist = np.min(np.hypot(X[..., None] - C[:, 0], Y[..., None] - C[:, 1]) - C[:, 2], axis=-1)
-        else:
-            dist = np.full(X.shape, INF)
-        return (dist >= req) & (np.abs(Y) <= YLIM + 0.1)
+        X, Y = np.asarray(X, float), np.asarray(Y, float)
+        ix = np.clip(np.rint((X - XMIN) / RES), 0, nx).astype(np.intp)
+        iy = np.clip(np.rint((Y - YMIN) / RES), 0, ny).astype(np.intp)
+        return ok[iy, ix] & (np.abs(Y) <= YLIM + 0.1)
+    clear.ok = ok
     return clear
+
+
+def _cell(v, lo):
+    return np.clip(np.rint((np.asarray(v, float) - lo) / RES), 0, None).astype(np.intp)
 
 
 HIT_BONUS = 1000.0   # one more target always beats any amount of extra path length
 HIT_TOL = 0.15       # the planned path passes within this height of a target's centre
 
 
-def plan(S, targets, clear, max_slope, dx_target=0.25, dy=0.1):
+def plan(S, targets, clear, max_slope, dx_target=0.25, dy=0.1, reach_only=False):
     """Shortest x-monotone path from S that passes through as many targets as possible.
 
     Columns are placed so that every target's x is exactly a column. Passing a target
     (within HIT_TOL vertically) earns a large bonus, so the dynamic programme first
     maximises the number of targets and then minimises length.
     Returns (path, anchors, hit) - anchors are indices in `path` that sit on a target,
-    hit the target indices - or None if no target can be reached."""
+    hit the target indices - or None if no target can be reached.
+    With reach_only, returns the set of targets some clear path can get to."""
     Sx, Sy = S
     grid = np.round(np.arange(-YLIM, YLIM + 1e-9, dy), 6)
     M = len(grid)
-    ts = np.array([0.2, 0.4, 0.6, 0.8])[:, None]
+    cols = np.arange(M)
 
     reach = [i for i, t in enumerate(targets) if t[0] > Sx + 0.05]
     if not reach:
-        return None
+        return set() if reach_only else None
     xs = [Sx]
     for bx in sorted(targets[i][0] for i in reach):
         if bx - xs[-1] < 0.02:
@@ -465,8 +534,30 @@ def plan(S, targets, clear, max_slope, dx_target=0.25, dy=0.1):
         return np.abs(grid - min(YLIM, max(-YLIM, targets[i][1]))) <= HIT_TOL + 1e-9
 
     def seg_ok(x0, y0, x1, y1):
+        """Is each segment (x0, y0[i]) -> (x1, y1[i]) clear? First an O(1) test on the raster
+        strip between x0 and x1: clear if every row it spans is clear across the strip,
+        blocked if an inner row is blocked across the strip. Only the rest are sampled
+        every ~0.05 units, grouped by sample count so each group is one lookup."""
         y0, y1 = np.broadcast_arrays(np.asarray(y0, float), np.asarray(y1, float))
-        return clear(x0 + (x1 - x0) * ts, y0[None, :] + (y1 - y0)[None, :] * ts).all(axis=0)
+        strip = clear.ok[:, int(_cell(min(x0, x1), XMIN)):int(_cell(max(x0, x1), XMIN)) + 1]
+        pc = np.concatenate(([0], np.cumsum(~strip.all(axis=1))))
+        pb = np.concatenate(([0], np.cumsum(~strip.any(axis=1))))
+        r0 = np.minimum(_cell(np.minimum(y0, y1), YMIN), len(_GY) - 1)
+        r1 = np.minimum(_cell(np.maximum(y0, y1), YMIN), len(_GY) - 1)
+        out = pc[r1 + 1] == pc[r0]
+        todo = ~out & ~((r1 - r0 >= 2) & (pb[r1] > pb[r0 + 1]))
+        if not todo.any():
+            return out
+        a, b = y0[todo], y1[todo]
+        n = np.ceil(np.hypot(x1 - x0, b - a) / 0.05)
+        n = np.maximum(4, 2 ** np.ceil(np.log2(np.maximum(n, 1)))).astype(int)
+        res = np.empty(a.shape, bool)
+        for k in np.unique(n):
+            sel = n == k
+            t = (np.arange(1, k + 1) / (k + 1))[:, None]
+            res[sel] = clear(x0 + (x1 - x0) * t, a[sel][None, :] + (b - a)[sel][None, :] * t).all(axis=0)
+        out[todo] = res
+        return out
 
     costs, backs = [np.array([0.0])], [None]
     for j in range(1, N + 1):
@@ -481,22 +572,50 @@ def plan(S, targets, clear, max_slope, dx_target=0.25, dy=0.1):
             new = np.where(ok, np.hypot(dx, dyv), INF)
             bk[:] = 0
         else:
-            D = int(max_slope * dx / dy + 1e-9)
-            for d in range(-D, D + 1):
-                m = np.arange(max(0, d), M + min(0, d))
-                src = m - d
-                c = prev[src] + math.hypot(dx, d * dy)
-                cand = np.isfinite(c) & node_ok[m] & (c < new[m])
-                if not cand.any():
-                    continue
-                mm, ss = m[cand], src[cand]
-                good = seg_ok(x0, grid[ss], x1, grid[mm])
-                new[mm[good]] = c[cand][good]
-                bk[mm[good]] = ss[good]
+            # every (offset, node) candidate at once, cheapest first; segments are checked in
+            # growing batches of ranks until each node has its cheapest clear incoming edge
+            D = min(M - 1, int(max_slope * dx / dy + 1e-9))
+            offs = np.arange(-D, D + 1)
+            src = cols[None, :] - offs[:, None]
+            C = np.where((src >= 0) & (src < M),
+                         prev[np.clip(src, 0, M - 1)] + np.hypot(dx, offs * dy)[:, None], INF)
+            C[:, ~node_ok] = INF
+            k0 = C.argmin(axis=0)
+            c0, s0 = C[k0, cols], src[k0, cols]
+            fin0 = np.isfinite(c0)
+            good0 = np.zeros(M, bool)
+            good0[fin0] = seg_ok(x0, grid[s0[fin0]], x1, grid[fin0])
+            new[good0], bk[good0] = c0[good0], s0[good0]
+            # nodes whose cheapest edge is blocked: sort just their candidates
+            uu = np.nonzero(fin0 & ~good0)[0]
+            Cu = C[:, uu]
+            order = np.argsort(Cu, axis=0, kind="stable")
+            Cs = np.take_along_axis(Cu, order, axis=0)
+            open_ = np.ones(len(uu), bool)
+            lo, size = 1, 2
+            while open_.any() and lo < len(offs):
+                hi = min(len(offs), lo + size)
+                ui = np.nonzero(open_)[0]
+                u = uu[ui]
+                bc = Cs[lo:hi, ui]
+                bs = src[order[lo:hi, ui], u[None, :]]
+                fin = np.isfinite(bc)
+                good = np.zeros(bc.shape, bool)
+                mm = np.broadcast_to(u, bc.shape)
+                good[fin] = seg_ok(x0, grid[bs[fin]], x1, grid[mm[fin]])
+                got = good.any(axis=0)
+                first = good.argmax(axis=0)[got]
+                new[u[got]] = bc[first, got]
+                bk[u[got]] = bs[first, got]
+                open_[ui[got | ~fin[-1]]] = False
+                lo, size = hi, size * 2
         for i in col_targets.get(j, []):
             new = np.where(near(i) & np.isfinite(new), new - HIT_BONUS, new)
         costs.append(new)
         backs.append(bk)
+
+    if reach_only:
+        return {i for j, ids in col_targets.items() for i in ids if np.isfinite(costs[j][near(i)]).any()}
 
     # the path may end at any target column (later columns may be walled off)
     best_j, best_m, best_c = None, None, INF
@@ -614,8 +733,8 @@ def build_expr(mode, knots, nd, k=None):
 # =========================================================================================
 # 5. Checking a function
 # =========================================================================================
-def check(expr, mode, shooter, targets, circles, friends, enemies, mask):
-    fn = compile_function(expr, mode)
+def check(expr, mode, shooter, targets, circles, friends, enemies, mask, max_len=MAX_LEN):
+    fn = compile_function(expr, mode, max_len)
     sold = [("T%d" % (i + 1), x, y) for i, (x, y) in enumerate(targets)]
     sold += [("enemy%d" % (i + 1), x, y) for i, (x, y) in enumerate(enemies)]
     sold += [("friend%d" % (i + 1), x, y) for i, (x, y) in enumerate(friends)]
@@ -643,7 +762,7 @@ def _score(res):
     return (0 if res["friendly_fire"] else 1, len(res["targets_hit"]))
 
 
-def solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope):
+def solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope, max_len=MAX_LEN):
     """Find a function that hits as many `targets` as possible (all of them if it can).
     Returns the best checked result, or None if no target can be reached at all."""
     targets = [tuple(t) for t in targets]
@@ -665,7 +784,7 @@ def solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope):
         out = realize(r[0], r[1], r[2], clear, m)
         if out:
             return out
-        # every function for this plan is over MAX_LEN: plan through fewer targets, keeping
+        # every function for this plan is over max_len: plan through fewer targets, keeping
         # the first k along the path, and binary-search the largest k that still fits
         order = sorted(r[2], key=lambda i: targets[i][0])
         lo, hi, found = 1, len(order) - 1, None
@@ -693,9 +812,9 @@ def solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope):
                 knots = [shooter, (shooter[0] + 3 / k + math.log(2) / (2 * k), shooter[1])] + base[1:]
             for nd in (4, 3, 2):
                 expr = build_expr(mode, knots, nd, k)
-                if len(expr) > MAX_LEN:
+                if len(expr) > max_len:
                     continue
-                res = check(expr, mode, shooter, targets, circles, friends, enemies, mask)
+                res = check(expr, mode, shooter, targets, circles, friends, enemies, mask, max_len)
                 res.update(expr=expr, knots=knots, margin=m, planned=planned)
                 if best is None or _score(res) > _score(best):
                     best = res
@@ -735,14 +854,12 @@ def solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope):
             return best
     if best:
         # tell apart "walled off" from "only clashes with the targets that were chosen"
-        best["blocked"] = []
-        for i in range(len(targets)):
-            if i in best["targets_hit"] or targets[i][0] <= shooter[0] + 0.3:
-                continue
-            start = shooter if mode != "d2y" else (shooter[0] + 0.3, shooter[1])
-            clear = make_clear(avoid, 0.08, [shooter, start, targets[i]])
-            if plan(start, [targets[i]], clear, max_slope) is None:
-                best["blocked"].append(i)
+        start = shooter if mode != "d2y" else (shooter[0] + 0.3, shooter[1])
+        clear = make_clear(avoid, 0.08, [shooter, start] + targets)
+        reached = plan(start, targets, clear, max_slope, reach_only=True)
+        best["blocked"] = [i for i in range(len(targets))
+                           if i not in best["targets_hit"] and targets[i][0] > shooter[0] + 0.3
+                           and i not in reached]
     return best
 
 
@@ -803,12 +920,16 @@ def interactive(a):
     return a
 
 
+def lim(n):
+    return "unlimited" if math.isinf(n) else "%d" % n
+
+
 def report(res, mode, a):
     label = MODES[mode][0]
     if res.get("expr"):
         print("\n  %s %s\n" % (label, res["expr"]))
         print("  path   : " + "  ->  ".join("(%.2f, %.2f)" % p for p in res["knots"]))
-        print("  length : %d / %d characters" % (len(res["expr"]), MAX_LEN))
+        print("  length : %d / %s characters" % (len(res["expr"]), lim(a.max_len)))
     n, got = len(a.target), set(res["targets_hit"])
     print("  targets: %d of %d hit" % (len(got), n))
     for i, (x, y) in enumerate(a.target):
@@ -819,7 +940,7 @@ def report(res, mode, a):
         elif i in res.get("blocked", []):
             why = "missed - obstacles block every path to it"
         elif i in res.get("too_long", []):
-            why = "missed - adding it makes the function longer than %d characters" % MAX_LEN
+            why = "missed - adding it makes the function longer than %d characters" % a.max_len
         elif res.get("planned") is not None and i not in res["planned"]:
             why = "missed - can't be hit on the same curve as the others"
         else:
@@ -827,7 +948,7 @@ def report(res, mode, a):
         print("    T%d (%.2f, %.2f): %s" % (i + 1, x, y, why))
     if res.get("too_long"):
         print("  note   : a curve through more targets exists, but its function would be over the "
-              "game's %d-character limit" % MAX_LEN)
+              "%d-character limit" % a.max_len)
     if res["friendly_fire"]:
         print("  WARNING: friendly fire on " + ", ".join(res["friendly_fire"]))
     if res["bonus"]:
@@ -906,6 +1027,7 @@ def web_solve(q):
     enemies = parse_list(q.get("enemy"), point)
     margin = float(q.get("margin") or 0.4)
     max_slope = float(q.get("max_slope") or 8.0)
+    max_len = UNLIMITED if q.get("unlimited") else MAX_LEN
     expr = (q.get("check") or "").strip()
     if not targets:
         raise ValueError("target: enter at least one x,y")
@@ -914,10 +1036,10 @@ def web_solve(q):
             raise ValueError("%s is off the board (x in -25..25, y in -15..15)" % name)
 
     if expr:
-        res = check(expr, mode, shooter, targets, circles, friends, enemies, make_mask(circles))
+        res = check(expr, mode, shooter, targets, circles, friends, enemies, make_mask(circles), max_len)
         res["expr"] = expr
     else:
-        res = solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope)
+        res = solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope, max_len)
         if res is None:
             raise ValueError("No path found: the obstacles wall off every target.")
 
@@ -930,12 +1052,13 @@ def web_solve(q):
         elif i in res.get("blocked", []):
             why = "missed - obstacles block every path to it"
         elif i in res.get("too_long", []):
-            why = "missed - function would be over %d characters" % MAX_LEN
+            why = "missed - function would be over %d characters" % max_len
         else:
             why = "missed"
         status.append("T%d (%g, %g): %s" % (i + 1, x, y, why))
     return {
         "label": MODES[mode][0], "expr": res.get("expr"), "ok": res["ok"],
+        "max_len": None if math.isinf(max_len) else max_len,
         "targets": status, "friendly_fire": res["friendly_fire"], "bonus": res["bonus"],
         "clearance": res["clearance"], "end": res["end"], "margin": res.get("margin"),
         "points": res["points"][::max(1, len(res["points"]) // 600)] + res["points"][-1:],
@@ -1001,6 +1124,8 @@ def main():
     p.add_argument("--enemy", type=point, action="append", default=[], help="other enemy, only reported, x,y")
     p.add_argument("--margin", type=float, default=0.4, help="distance to keep from obstacles (default 0.4)")
     p.add_argument("--max-slope", type=float, default=8.0, help="steepest allowed segment (default 8)")
+    p.add_argument("--max-len", type=int, default=MAX_LEN,
+                   help="longest function to write (default %d, 0 = unlimited, for a server run with --unlimited)" % MAX_LEN)
     p.add_argument("--check", metavar="EXPR", help="only simulate this function and report what it hits")
     p.add_argument("--plot", metavar="FILE.png", help="save a picture of the shot (needs matplotlib)")
     # let "--shooter -20,3" work (argparse would read "-20,3" as an option)
@@ -1015,6 +1140,7 @@ def main():
             argv.append(raw[i])
             i += 1
     a = p.parse_args(argv)
+    a.max_len = UNLIMITED if a.max_len <= 0 else a.max_len
 
     if a.shooter is None or not a.target:
         interactive(a)
@@ -1028,13 +1154,13 @@ def main():
 
     if a.check:
         try:
-            res = check(a.check, a.mode, a.shooter, a.target, a.circle, a.friend, a.enemy, make_mask(a.circle))
+            res = check(a.check, a.mode, a.shooter, a.target, a.circle, a.friend, a.enemy, make_mask(a.circle), a.max_len)
         except ValueError as e:
             sys.exit("The game would reject this function: " + str(e))
         print("\n  %s %s\n" % (MODES[a.mode][0], a.check))
         report(res, a.mode, a)
     else:
-        res = solve(a.mode, a.shooter, a.target, a.circle, a.friend, a.enemy, a.margin, a.max_slope)
+        res = solve(a.mode, a.shooter, a.target, a.circle, a.friend, a.enemy, a.margin, a.max_slope, a.max_len)
         if res is None:
             sys.exit("No path found: the obstacles wall off every target (the shot can only move rightwards). "
                      "Try another soldier, or check the circle sizes.")

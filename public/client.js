@@ -45,6 +45,8 @@
     switch (m.t) {
       case 'welcome':
         S.myId = m.id; S.token = m.token; seat.set(m.token);
+        GW.setMaxLen(m.maxLen ?? 300);
+        if (GW.getMaxLen()) $('#fn-input').maxLength = GW.getMaxLen(); else $('#fn-input').removeAttribute('maxlength');
         break;
       case 'rooms':
         S.rooms = m.rooms; S.room = null; S.game = null;

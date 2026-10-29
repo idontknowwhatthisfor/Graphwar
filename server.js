@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Graphwar LAN server: serves the browser client and runs rooms over WebSocket.
-// No dependencies: `node server.js [port]`.
+// No dependencies: `node server.js [port] [--unlimited]`.
+// --unlimited (or UNLIMITED=1) lifts the 300-character limit on functions.
 'use strict';
 
 const http = require('http');
@@ -11,7 +12,9 @@ const os = require('os');
 const GW = require('./public/shared.js');
 const { PLANE } = GW;
 
-const PORT = parseInt(process.argv[2] || process.env.PORT || '8080', 10);
+const ARGS = process.argv.slice(2);
+const PORT = parseInt(ARGS.find((a) => /^\d+$/.test(a)) || process.env.PORT || '8080', 10);
+if (ARGS.includes('--unlimited') || process.env.UNLIMITED === '1') GW.setMaxLen(0);
 const PUBLIC = path.join(__dirname, 'public');
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -122,7 +125,7 @@ function onConnect(conn) {
         players.set(me.token, me);
       }
       me.conn = conn;
-      conn.send({ t: 'welcome', id: me.id, token: me.token });
+      conn.send({ t: 'welcome', id: me.id, token: me.token, maxLen: GW.getMaxLen() });
       const room = me.roomId && rooms.get(me.roomId);
       if (room) { broadcastRoom(room); if (room.game) conn.send(gameSnapshot(room)); }
       else { me.roomId = null; sendRooms(conn); }
@@ -502,4 +505,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('Graphwar LAN server running. Open on any device on your network:');
   for (const ip of ips) console.log('  http://' + ip + ':' + PORT);
   console.log('  http://localhost:' + PORT + ' (this machine)');
+  console.log('Function length: ' + (GW.getMaxLen() ? 'max ' + GW.getMaxLen() + ' characters' : 'unlimited'));
 });
