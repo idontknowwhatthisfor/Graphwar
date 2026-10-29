@@ -20,6 +20,7 @@ Examples
   python3 calculate.py --friend -15,5 --enemy 18,0 ...   (avoid teammates / report bonus hits)
   python3 calculate.py --check "0.3*x" --shooter -20,3 --target 15,-4 --circle -5,0,3
   python3 calculate.py            # asks for everything interactively
+  python3 calculate.py --serve    # web page at http://localhost:8000 (--serve 9000 for another port)
 
 Modes: y   -> type into  y   = ...
        dy  -> type into  y'  = ...
@@ -353,6 +354,8 @@ def simulate(fn, mode, X0, Y0, soldiers, mask):
             a4 = fn(X + h, y4, v4)
             return (y + h * (v + 2 * v2 + 2 * v3 + v4) / 6, v + h * (a1 + 2 * a2 + 2 * a3 + a4) / 6)
 
+    # mask lookup inlined: this loop runs up to 400k times per check
+    floor, mrows = math.floor, mask.tolist()
     X, state, last, it = X0, (Y0, 0.0), (X0, Y0), 0
     while it < 400000:
         it += 1
@@ -392,7 +395,8 @@ def simulate(fn, mode, X0, Y0, soldiers, mask):
                 if points[-1][0] != wx:
                     points.append((wx, wy))
                 hits.append((sid, len(points) - 1))
-        if mask_at(mask, wx, wy):
+        ix, iy = floor((wx - XMIN) * SCALE), floor((YMAX - wy) * SCALE)
+        if 0 <= ix < PX_W and 0 <= iy < PX_H and mrows[iy][ix]:
             if points[-1][0] != wx:
                 points.append((wx, wy))
             explosion = (wx, wy)
@@ -658,7 +662,29 @@ def solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope):
         r = plan(start, targets, clear, max_slope)
         if r is None:
             return None
-        path, anchors, planned = r
+        out = realize(r[0], r[1], r[2], clear, m)
+        if out:
+            return out
+        # every function for this plan is over MAX_LEN: plan through fewer targets, keeping
+        # the first k along the path, and binary-search the largest k that still fits
+        order = sorted(r[2], key=lambda i: targets[i][0])
+        lo, hi, found = 1, len(order) - 1, None
+        while lo <= hi:
+            k = (lo + hi) // 2
+            sub = order[:k]
+            rk = plan(start, [targets[i] for i in sub], clear, max_slope)
+            out_k = rk and realize(rk[0], rk[1], [sub[i] for i in rk[2]], clear, m)
+            if out_k:
+                found, lo = out_k, k + 1
+            else:
+                hi = k - 1
+        if found:
+            found[0]["too_long"] = [i for i in order if i not in found[0]["targets_hit"]]
+        return found
+
+    def realize(path, anchors, planned, clear, m):
+        """Turn a planned path into a function and check it. Returns (result, planned) or
+        None when every version of the function is longer than the game allows."""
         base = simplify(path, clear, anchors)
         best = None
         for k in ([12.0, 8.0, 20.0] if mode == "d2y" else [None]):
@@ -792,11 +818,16 @@ def report(res, mode, a):
             why = "missed - it is not to the right of your soldier"
         elif i in res.get("blocked", []):
             why = "missed - obstacles block every path to it"
+        elif i in res.get("too_long", []):
+            why = "missed - adding it makes the function longer than %d characters" % MAX_LEN
         elif res.get("planned") is not None and i not in res["planned"]:
             why = "missed - can't be hit on the same curve as the others"
         else:
             why = "missed"
         print("    T%d (%.2f, %.2f): %s" % (i + 1, x, y, why))
+    if res.get("too_long"):
+        print("  note   : a curve through more targets exists, but its function would be over the "
+              "game's %d-character limit" % MAX_LEN)
     if res["friendly_fire"]:
         print("  WARNING: friendly fire on " + ", ".join(res["friendly_fire"]))
     if res["bonus"]:
@@ -847,7 +878,118 @@ def plot(res, a, path):
     print("  plot   : saved to " + path)
 
 
+# =========================================================================================
+# 7. Web page: python3 calculate.py --serve  ->  http://localhost:8000
+# =========================================================================================
+def parse_list(text, conv):
+    """'1,2,3 --circle 1,6,4' or one per line -> [conv('1,2,3'), conv('1,6,4')]."""
+    text = re.sub(r"--[a-z-]+", " ", text or "")
+    text = re.sub(r"\s*,\s*", ",", text.replace("(", " ").replace(")", " "))
+    return [conv(t) for t in re.split(r"[\s;]+", text) if t]
+
+
+def web_solve(q):
+    """q: dict of strings from the page. Returns a JSON-ready dict."""
+    def one(name, conv):
+        v = parse_list(q.get(name, ""), conv)
+        if len(v) != 1:
+            raise ValueError("%s: enter exactly one value" % name)
+        return v[0]
+
+    mode = q.get("mode") or "y"
+    if mode not in MODES:
+        raise ValueError("mode must be y, dy or d2y")
+    shooter = one("shooter", point)
+    targets = parse_list(q.get("target"), point)
+    circles = parse_list(q.get("circle"), circle)
+    friends = parse_list(q.get("friend"), point)
+    enemies = parse_list(q.get("enemy"), point)
+    margin = float(q.get("margin") or 0.4)
+    max_slope = float(q.get("max_slope") or 8.0)
+    expr = (q.get("check") or "").strip()
+    if not targets:
+        raise ValueError("target: enter at least one x,y")
+    for name, (x, y) in [("shooter", shooter)] + [("T%d" % (i + 1), t) for i, t in enumerate(targets)]:
+        if not (XMIN <= x <= XMAX and YMIN <= y <= YMAX):
+            raise ValueError("%s is off the board (x in -25..25, y in -15..15)" % name)
+
+    if expr:
+        res = check(expr, mode, shooter, targets, circles, friends, enemies, make_mask(circles))
+        res["expr"] = expr
+    else:
+        res = solve(mode, shooter, targets, circles, friends, enemies, margin, max_slope)
+        if res is None:
+            raise ValueError("No path found: the obstacles wall off every target.")
+
+    status = []
+    for i, (x, y) in enumerate(targets):
+        if i in res["targets_hit"]:
+            why = "HIT"
+        elif x <= shooter[0] + 0.3:
+            why = "missed - not to the right of your soldier"
+        elif i in res.get("blocked", []):
+            why = "missed - obstacles block every path to it"
+        elif i in res.get("too_long", []):
+            why = "missed - function would be over %d characters" % MAX_LEN
+        else:
+            why = "missed"
+        status.append("T%d (%g, %g): %s" % (i + 1, x, y, why))
+    return {
+        "label": MODES[mode][0], "expr": res.get("expr"), "ok": res["ok"],
+        "targets": status, "friendly_fire": res["friendly_fire"], "bonus": res["bonus"],
+        "clearance": res["clearance"], "end": res["end"], "margin": res.get("margin"),
+        "points": res["points"][::max(1, len(res["points"]) // 600)] + res["points"][-1:],
+        "knots": res.get("knots"),
+        "board": {"shooter": shooter, "targets": targets, "circles": circles,
+                  "friends": friends, "enemies": enemies},
+    }
+
+
+def serve(port):
+    import json
+    import os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calculate.html")
+
+    class Handler(BaseHTTPRequestHandler):
+        def send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.split("?")[0] not in ("/", "/index.html"):
+                return self.send(404, b"not found", "text/plain")
+            with open(page, "rb") as f:
+                self.send(200, f.read(), "text/html; charset=utf-8")
+
+        def do_POST(self):
+            if self.path != "/solve":
+                return self.send(404, b"not found", "text/plain")
+            try:
+                q = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                out = web_solve(q)
+            except Exception as e:  # noqa - report any bad input back to the page
+                out = {"error": str(e)}
+            self.send(200, json.dumps(out).encode(), "application/json")
+
+        def log_message(self, *args):
+            pass
+
+    print("Graphwar calculator: http://localhost:%d  (Ctrl+C to stop)" % port)
+    try:
+        ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 def main():
+    if "--serve" in sys.argv:
+        i = sys.argv.index("--serve")
+        nxt = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        return serve(int(nxt) if nxt.isdigit() else 8000)
     p = argparse.ArgumentParser(description="Find a Graphwar function from your soldier through one or more targets.",
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     p.add_argument("--mode", choices=list(MODES), default="y", help="y (y=), dy (y'=) or d2y (y''=)")

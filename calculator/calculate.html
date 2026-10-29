@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Graphwar Calculator</title>
+<style>
+  body { font: 15px system-ui, sans-serif; background: #12151c; color: #dde3ec; margin: 0; padding: 16px; }
+  main { max-width: 720px; margin: auto; }
+  label { display: block; margin: 10px 0 3px; color: #9aa6b8; }
+  input, select, textarea { width: 100%; box-sizing: border-box; padding: 7px; font: 14px ui-monospace, monospace;
+    background: #1c212b; color: #dde3ec; border: 1px solid #333b49; border-radius: 4px; }
+  textarea { height: 3.2em; resize: vertical; }
+  .row { display: flex; gap: 10px; } .row > div { flex: 1; }
+  button { margin-top: 14px; padding: 9px 22px; font-size: 15px; font-weight: 600; background: #8ab4ff; color: #0d1424;
+    border: 0; border-radius: 10px; cursor: pointer; }
+  button:hover { background: #a5c5ff; }
+  button:disabled { opacity: .4; cursor: default; }
+  pre { background: #1c212b; padding: 10px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
+  .expr { font-size: 16px; color: #ffd166; }
+  svg { width: 100%; background: #0d1016; border-radius: 4px; margin-top: 10px; }
+  small { color: #6b7385; }
+</style>
+</head>
+<body>
+<main>
+<h2>Graphwar shot calculator</h2>
+<small>Use the coordinates on your own screen. Several values: separate with spaces or new lines,
+  e.g. <code>1,2,3 1,6,4</code> (<code>--circle 1,2,3 --circle 1,6,4</code> also works).</small>
+
+<div class="row">
+  <div><label for="mode">Mode</label>
+    <select id="mode"><option value="y">y =</option><option value="dy">y' =</option><option value="d2y">y'' =</option></select></div>
+  <div><label for="shooter">Shooter (x,y)</label><input id="shooter" placeholder="-20,3"></div>
+</div>
+<label for="target">Targets (x,y ...)</label><textarea id="target" placeholder="15,-4 2,1"></textarea>
+<label for="circle">Circles / obstacles (x,y,r ...)</label><textarea id="circle" placeholder="1,2,3 1,6,4"></textarea>
+<label for="friend">Friends to avoid (x,y ...)</label><textarea id="friend" placeholder="optional"></textarea>
+<label for="enemy">Other enemies, only reported (x,y ...)</label><textarea id="enemy" placeholder="optional"></textarea>
+<div class="row">
+  <div><label for="margin">Margin</label><input id="margin" value="0.4"></div>
+  <div><label for="max_slope">Max slope</label><input id="max_slope" value="8"></div>
+</div>
+<label for="check">Check a function instead (optional)</label><input id="check" placeholder="e.g. 0.3*x">
+<button id="go">Calculate</button>
+
+<div id="out"></div>
+</main>
+<script>
+const FIELDS = ["mode", "shooter", "target", "circle", "friend", "enemy", "margin", "max_slope", "check"];
+const $ = id => document.getElementById(id);
+
+try { const saved = JSON.parse(localStorage.getItem("calc") || "{}");
+  FIELDS.forEach(f => { if (saved[f] != null) $(f).value = saved[f]; }); } catch (e) {}
+
+$("go").onclick = async () => {
+  const q = {}; FIELDS.forEach(f => q[f] = $(f).value);
+  try { localStorage.setItem("calc", JSON.stringify(q)); } catch (e) {}
+  $("go").disabled = true; $("out").innerHTML = "<p>Calculating…</p>";
+  try {
+    const r = await (await fetch("/solve", { method: "POST", body: JSON.stringify(q) })).json();
+    render(r);
+  } catch (e) { $("out").innerHTML = "<pre>" + e + "</pre>"; }
+  $("go").disabled = false;
+};
+
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+function render(r) {
+  if (r.error) { $("out").innerHTML = "<pre>Error: " + esc(r.error) + "</pre>"; return; }
+  let t = r.targets.join("\n");
+  if (r.friendly_fire.length) t += "\nWARNING: friendly fire on " + r.friendly_fire.join(", ");
+  if (r.bonus.length) t += "\nbonus: also hits " + r.bonus.join(", ");
+  if (r.clearance != null) t += "\nclosest: " + r.clearance.toFixed(2) + " units from an obstacle";
+  t += "\nafter: shot " + r.end;
+  $("out").innerHTML =
+    "<pre class='expr'>" + esc(r.label + " " + r.expr) + "</pre>" +
+    "<small>" + r.expr.length + " / 300 characters</small> <button id='copy' style='margin:0 0 0 8px;padding:3px 10px'>Copy</button>" +
+    "<pre>" + esc(t) + "</pre>" + plot(r);
+  $("copy").onclick = () => navigator.clipboard.writeText(r.expr);
+}
+
+function plot(r) {
+  // board is x -25..25, y -15..15; SVG y points down
+  const P = (x, y) => (x + 25).toFixed(2) + "," + (15 - y).toFixed(2);
+  const disc = ([x, y], c, o = 1) => `<circle cx="${x + 25}" cy="${15 - y}" r="0.5" fill="${c}" opacity="${o}"/>`;
+  const b = r.board;
+  let s = `<svg viewBox="0 0 50 30">`;
+  for (let i = -20; i <= 20; i += 5) s += `<line x1="${i + 25}" y1="0" x2="${i + 25}" y2="30" stroke="#222834" stroke-width="0.05"/>`;
+  for (let i = -10; i <= 10; i += 5) s += `<line x1="0" y1="${15 - i}" x2="50" y2="${15 - i}" stroke="#222834" stroke-width="0.05"/>`;
+  b.circles.forEach(([x, y, rr]) => s += `<circle cx="${x + 25}" cy="${15 - y}" r="${rr}" fill="#4a5263"/>`);
+  if (r.knots) s += `<polyline points="${r.knots.map(p => P(...p)).join(" ")}" fill="none" stroke="#ffd166" stroke-width="0.08" stroke-dasharray="0.3 0.3"/>`;
+  s += `<polyline points="${r.points.map(p => P(...p)).join(" ")}" fill="none" stroke="#ff6b6b" stroke-width="0.15"/>`;
+  s += disc(b.shooter, "#ff6b6b");
+  b.targets.forEach(t => s += disc(t, "#5fb8ff"));
+  b.friends.forEach(t => s += disc(t, "#ff6b6b", 0.5));
+  b.enemies.forEach(t => s += disc(t, "#5fb8ff", 0.5));
+  return s + "</svg>";
+}
+</script>
+</body>
+</html>
